@@ -1,0 +1,68 @@
+<icecast>
+
+    <location>Davao City, Philippines</location>
+    <admin>admin@jazbazphilippines.com</admin>
+
+    <limits>
+        <clients>100</clients>
+        <sources>2</sources>
+        <queue-size>524288</queue-size>
+        <client-timeout>30</client-timeout>
+        <header-timeout>15</header-timeout>
+        <source-timeout>10</source-timeout>
+        <burst-on-connect>1</burst-on-connect>
+        <burst-size>65535</burst-size>
+    </limits>
+
+    <authentication>
+        <source-password>HelloTigger2013</source-password>
+        <relay-password>HelloTigger2013</relay-password>
+        <admin-user>admin</admin-user>
+        <admin-password>f02ddf2ab97afc4fcf43023e</admin-password>
+    </authentication>
+
+    <hostname>radio.jazbazphilippines.com</hostname>
+
+    <listen-socket>
+        <port>8100</port>
+        <bind-address>127.0.0.1</bind-address>
+    </listen-socket>
+
+    <listen-socket>
+        <port>8101</port>
+        <bind-address>0.0.0.0</bind-address>
+        <ssl>1</ssl>
+    </listen-socket>
+
+    <fileserve>1</fileserve>
+
+    <paths>
+        <basedir>/usr/share/icecast2</basedir>
+        <logdir>/home/baz/jb-radio/logs</logdir>
+        <webroot>/usr/share/icecast2/web</webroot>
+        <adminroot>/usr/share/icecast2/admin</adminroot>
+        <ssl-certificate>/home/baz/jb-radio/config/icecast.pem</ssl-certificate>
+    </paths>
+
+    <logging>
+        <accesslog>access.log</accesslog>
+        <errorlog>error.log</errorlog>
+        <loglevel>3</loglevel>
+        <logsize>10000</logsize>
+    </logging>
+
+    <mount type="normal">
+        <mount-name>/jbradio</mount-name>
+        <username>jbradio</username>
+        <password>HelloTigger2013</password>
+        <stream-name>JB Radio</stream-name>
+        <stream-description>JazBaz Philippines Radio</stream-description>
+        <genre>Radio</genre>
+        <public>0</public>
+    </mount>
+
+    <security>
+        <chroot>0</chroot>
+    </security>
+
+</icecast>
