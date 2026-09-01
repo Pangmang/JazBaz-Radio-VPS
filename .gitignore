@@ -2,3 +2,6 @@ logs/
 config/icecast.pem
 config/source-password.txt
 config/admin-password.txt
+
+receiver/node_modules/
+receiver/*.webm
