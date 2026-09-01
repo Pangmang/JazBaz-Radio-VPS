@@ -1,0 +1,16 @@
+[Unit]
+Description=JB Radio DJ Receiver
+After=network.target jb-radio-icecast.service
+Wants=jb-radio-icecast.service
+
+[Service]
+Type=simple
+User=baz
+Group=baz
+WorkingDirectory=/home/baz/jb-radio/receiver
+ExecStart=/usr/bin/node /home/baz/jb-radio/receiver/index.js
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
