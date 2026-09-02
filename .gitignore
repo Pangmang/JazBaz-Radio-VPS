@@ -5,3 +5,6 @@ config/admin-password.txt
 
 receiver/node_modules/
 receiver/*.webm
+
+config/stream-token-secret.txt
+receiver/index.js.pre-stream-auth

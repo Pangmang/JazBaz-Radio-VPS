@@ -1,3 +1,5 @@
+const crypto = require("crypto");
+
 const http = require("http");
 
 const net = require("net");
@@ -21,6 +23,18 @@ const ICECAST_USER = "jbradio";
 const PASSWORD_FILE =
   "/home/baz/jb-radio/config/source-password.txt";
 
+const STREAM_TOKEN_SECRET_FILE =
+  "/home/baz/jb-radio/config/stream-token-secret.txt";
+
+const STREAM_TOKEN_SECRET = fs
+  .readFileSync(
+    STREAM_TOKEN_SECRET_FILE,
+    "utf8",
+  )
+  .trim();
+
+const usedNonces = new Map();
+
 let activeSocket = null;
 
 let ffmpeg = null;
@@ -28,6 +42,153 @@ let ffmpeg = null;
 let icecastSocket = null;
 
 let pcmReady = false;
+
+function cleanUsedNonces() {
+  const now =
+    Math.floor(Date.now() / 1000);
+
+  for (const [
+    nonce,
+    expires,
+  ] of usedNonces.entries()) {
+    if (expires <= now) {
+      usedNonces.delete(nonce);
+    }
+  }
+}
+
+function validateStreamToken(token) {
+  if (!token) {
+    return {
+      valid: false,
+      reason: "Missing token",
+    };
+  }
+
+  const parts =
+    token.split(".");
+
+  if (parts.length !== 3) {
+    return {
+      valid: false,
+      reason: "Invalid token format",
+    };
+  }
+
+  const [
+    expiresText,
+    nonce,
+    suppliedSignature,
+  ] = parts;
+
+  const expires =
+    Number(expiresText);
+
+  if (
+    !Number.isInteger(expires) ||
+    !nonce ||
+    !suppliedSignature
+  ) {
+    return {
+      valid: false,
+      reason: "Invalid token",
+    };
+  }
+
+  const now =
+    Math.floor(Date.now() / 1000);
+
+  if (expires <= now) {
+    return {
+      valid: false,
+      reason: "Token expired",
+    };
+  }
+
+  cleanUsedNonces();
+
+  if (usedNonces.has(nonce)) {
+    return {
+      valid: false,
+      reason: "Token already used",
+    };
+  }
+
+  const payload =
+    `${expiresText}.${nonce}`;
+
+  const expectedSignature =
+    crypto
+      .createHmac(
+        "sha256",
+        STREAM_TOKEN_SECRET,
+      )
+      .update(payload)
+      .digest("hex");
+
+  const suppliedBuffer =
+    Buffer.from(
+      suppliedSignature,
+      "utf8",
+    );
+
+  const expectedBuffer =
+    Buffer.from(
+      expectedSignature,
+      "utf8",
+    );
+
+  if (
+    suppliedBuffer.length !==
+    expectedBuffer.length
+  ) {
+    return {
+      valid: false,
+      reason: "Invalid signature",
+    };
+  }
+
+  if (
+    !crypto.timingSafeEqual(
+      suppliedBuffer,
+      expectedBuffer,
+    )
+  ) {
+    return {
+      valid: false,
+      reason: "Invalid signature",
+    };
+  }
+
+  return {
+    valid: true,
+    nonce,
+    expires,
+  };
+}
+
+function rejectUpgrade(
+  socket,
+  statusCode,
+  message,
+) {
+  try {
+    socket.write(
+      `HTTP/1.1 ${statusCode} ${message}\r\n` +
+        "Connection: close\r\n" +
+        "Content-Type: text/plain\r\n" +
+        `Content-Length: ${Buffer.byteLength(
+          message,
+        )}\r\n` +
+        "\r\n" +
+        message,
+    );
+  } catch {}
+
+  try {
+    socket.destroy();
+  } catch {}
+}
 
 function stopBroadcast(
   reason = "Broadcast stopped",
@@ -330,8 +491,99 @@ const server =
 
 const wss =
   new WebSocketServer({
-    server,
+    noServer: true,
   });
+
+server.on(
+  "upgrade",
+  (
+    request,
+    socket,
+    head,
+  ) => {
+    let requestUrl;
+
+    try {
+      requestUrl = new URL(
+        request.url,
+        "http://127.0.0.1",
+      );
+    } catch {
+      rejectUpgrade(
+        socket,
+        400,
+        "Bad Request",
+      );
+
+      return;
+    }
+
+    if (
+      requestUrl.pathname !==
+      "/dj-stream"
+    ) {
+      rejectUpgrade(
+        socket,
+        404,
+        "Not Found",
+      );
+
+      return;
+    }
+
+    const token =
+      requestUrl.searchParams.get(
+        "token",
+      );
+
+    const validation =
+      validateStreamToken(
+        token,
+      );
+
+    if (!validation.valid) {
+      console.log(
+        `DJ connection rejected: ${validation.reason}`,
+      );
+
+      rejectUpgrade(
+        socket,
+        401,
+        "Unauthorized",
+      );
+
+      return;
+    }
+
+    if (activeSocket) {
+      rejectUpgrade(
+        socket,
+        503,
+        "Another DJ is already broadcasting",
+      );
+
+      return;
+    }
+
+    usedNonces.set(
+      validation.nonce,
+      validation.expires,
+    );
+
+    wss.handleUpgrade(
+      request,
+      socket,
+      head,
+      (webSocket) => {
+        wss.emit(
+          "connection",
+          webSocket,
+          request,
+        );
+      },
+    );
+  },
+);
 
 wss.on(
   "connection",
@@ -348,7 +600,7 @@ wss.on(
     activeSocket = socket;
 
     console.log(
-      "DJ connected",
+      "DJ connected with valid stream token",
     );
 
     socket.on(
