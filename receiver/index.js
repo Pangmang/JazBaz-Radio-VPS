@@ -1,24 +1,21 @@
 const crypto = require("crypto");
-
 const http = require("http");
-
 const net = require("net");
-
 const fs = require("fs");
-
 const { spawn } = require("child_process");
-
 const { WebSocketServer } = require("ws");
 
 const PORT = 8200;
 
 const ICECAST_HOST = "127.0.0.1";
-
 const ICECAST_PORT = 8100;
-
 const ICECAST_MOUNT = "/jbradio";
-
 const ICECAST_USER = "jbradio";
+
+const RECONNECT_GRACE_MS = 60 * 1000;
+const AUDIO_DATA_TIMEOUT_MS = 3 * 1000;
+const AUDIO_WATCHDOG_INTERVAL_MS = 1000;
+const WEBSOCKET_PING_INTERVAL_MS = 2 * 1000;
 
 const PASSWORD_FILE =
   "/home/baz/jb-radio/config/source-password.txt";
@@ -38,10 +35,18 @@ const usedNonces = new Map();
 let activeSocket = null;
 
 let ffmpeg = null;
+let silenceFfmpeg = null;
 
 let icecastSocket = null;
 
 let pcmReady = false;
+
+let reconnectGraceActive = false;
+let reconnectGraceTimer = null;
+
+let lastAudioDataAt = 0;
+let audioWatchdogTimer = null;
+let streamHasStarted = false;
 
 function cleanUsedNonces() {
   const now =
@@ -190,10 +195,73 @@ function rejectUpgrade(
   } catch {}
 }
 
+function clearReconnectGrace() {
+  reconnectGraceActive = false;
+
+  if (reconnectGraceTimer) {
+    clearTimeout(
+      reconnectGraceTimer,
+    );
+
+    reconnectGraceTimer = null;
+  }
+}
+
+function stopAudioWatchdog() {
+  if (audioWatchdogTimer) {
+    clearInterval(
+      audioWatchdogTimer,
+    );
+
+    audioWatchdogTimer = null;
+  }
+
+  lastAudioDataAt = 0;
+  streamHasStarted = false;
+}
+
+function stopFfmpeg() {
+  pcmReady = false;
+
+  if (!ffmpeg) {
+    return;
+  }
+
+  const process = ffmpeg;
+
+  ffmpeg = null;
+
+  try {
+    process.stdin.end();
+  } catch {}
+
+  try {
+    process.kill("SIGTERM");
+  } catch {}
+}
+
+function stopSilenceFfmpeg() {
+  if (!silenceFfmpeg) {
+    return;
+  }
+
+  const process =
+    silenceFfmpeg;
+
+  silenceFfmpeg = null;
+
+  try {
+    process.kill("SIGTERM");
+  } catch {}
+}
+
 function stopBroadcast(
   reason = "Broadcast stopped",
 ) {
   console.log(reason);
+
+  clearReconnectGrace();
+  stopAudioWatchdog();
 
   pcmReady = false;
 
@@ -203,26 +271,16 @@ function stopBroadcast(
     activeSocket = null;
 
     try {
-      socket.close();
+      socket.terminate();
     } catch {}
   }
 
-  if (ffmpeg) {
-    const process = ffmpeg;
-
-    ffmpeg = null;
-
-    try {
-      process.stdin.end();
-    } catch {}
-
-    try {
-      process.kill("SIGTERM");
-    } catch {}
-  }
+  stopFfmpeg();
+  stopSilenceFfmpeg();
 
   if (icecastSocket) {
-    const socket = icecastSocket;
+    const socket =
+      icecastSocket;
 
     icecastSocket = null;
 
@@ -233,6 +291,12 @@ function stopBroadcast(
 }
 
 function startFfmpeg() {
+  stopSilenceFfmpeg();
+
+  if (ffmpeg) {
+    return;
+  }
+
   const process = spawn(
     "ffmpeg",
     [
@@ -279,6 +343,7 @@ function startFfmpeg() {
     "data",
     (chunk) => {
       if (
+        ffmpeg === process &&
         icecastSocket &&
         !icecastSocket.destroyed &&
         icecastSocket.writable
@@ -317,6 +382,7 @@ function startFfmpeg() {
         ffmpeg === process
       ) {
         ffmpeg = null;
+        pcmReady = false;
       }
     },
   );
@@ -326,6 +392,204 @@ function startFfmpeg() {
   console.log(
     "Opus relay started: WebM/Opus -> stereo MP3 192k",
   );
+}
+
+function startSilenceFfmpeg() {
+  if (
+    silenceFfmpeg ||
+    !icecastSocket ||
+    icecastSocket.destroyed ||
+    !icecastSocket.writable
+  ) {
+    return;
+  }
+
+  const process = spawn(
+    "ffmpeg",
+    [
+      "-hide_banner",
+      "-loglevel",
+      "warning",
+
+      "-re",
+
+      "-f",
+      "lavfi",
+
+      "-i",
+      "anullsrc=r=44100:cl=stereo",
+
+      "-vn",
+
+      "-codec:a",
+      "libmp3lame",
+
+      "-b:a",
+      "192k",
+
+      "-f",
+      "mp3",
+
+      "pipe:1",
+    ],
+    {
+      stdio: [
+        "ignore",
+        "pipe",
+        "pipe",
+      ],
+    },
+  );
+
+  silenceFfmpeg = process;
+
+  process.stdout.on(
+    "data",
+    (chunk) => {
+      if (
+        silenceFfmpeg === process &&
+        icecastSocket &&
+        !icecastSocket.destroyed &&
+        icecastSocket.writable
+      ) {
+        icecastSocket.write(
+          chunk,
+        );
+      }
+    },
+  );
+
+  process.stderr.on(
+    "data",
+    (data) => {
+      const message =
+        data
+          .toString()
+          .trim();
+
+      if (message) {
+        console.log(
+          `Silence FFmpeg: ${message}`,
+        );
+      }
+    },
+  );
+
+  process.on(
+    "close",
+    (code) => {
+      if (
+        silenceFfmpeg === process
+      ) {
+        silenceFfmpeg = null;
+      }
+
+      console.log(
+        `Silence relay stopped with code ${code}`,
+      );
+    },
+  );
+
+  console.log(
+    "DJ connection lost - silence relay started",
+  );
+}
+
+function beginReconnectGrace(
+  reason = "DJ disconnected",
+) {
+  if (
+    reconnectGraceActive
+  ) {
+    return;
+  }
+
+  reconnectGraceActive = true;
+
+  stopAudioWatchdog();
+  stopFfmpeg();
+
+  startSilenceFfmpeg();
+
+  console.log(
+    `${reason} - allowing 60 seconds to reconnect`,
+  );
+
+  reconnectGraceTimer =
+    setTimeout(() => {
+      reconnectGraceTimer = null;
+
+      if (
+        reconnectGraceActive &&
+        !activeSocket
+      ) {
+        stopBroadcast(
+          "DJ reconnect grace period expired",
+        );
+      }
+    }, RECONNECT_GRACE_MS);
+}
+
+function handleLostDjConnection(
+  reason,
+) {
+  if (
+    !activeSocket
+  ) {
+    return;
+  }
+
+  const socket =
+    activeSocket;
+
+  activeSocket = null;
+
+  try {
+    socket.terminate();
+  } catch {}
+
+  beginReconnectGrace(
+    reason,
+  );
+}
+
+function startAudioWatchdog() {
+  stopAudioWatchdog();
+
+  lastAudioDataAt =
+    Date.now();
+
+  audioWatchdogTimer =
+    setInterval(() => {
+      if (
+        !activeSocket ||
+        reconnectGraceActive ||
+        !streamHasStarted
+      ) {
+        return;
+      }
+
+      const silenceDuration =
+        Date.now() -
+        lastAudioDataAt;
+
+      if (
+        silenceDuration <
+        AUDIO_DATA_TIMEOUT_MS
+      ) {
+        return;
+      }
+
+      console.log(
+        `No DJ audio data received for ${Math.round(
+          silenceDuration / 1000,
+        )} seconds`,
+      );
+
+      handleLostDjConnection(
+        "DJ audio data timeout",
+      );
+    }, AUDIO_WATCHDOG_INTERVAL_MS);
 }
 
 function startRelay() {
@@ -349,7 +613,6 @@ function startRelay() {
   icecastSocket = socket;
 
   let responseLogged = false;
-
   let responseBuffer = "";
 
   socket.on(
@@ -442,9 +705,17 @@ function startRelay() {
     "close",
     () => {
       if (
-        socket ===
-          icecastSocket &&
-        activeSocket
+        socket !==
+        icecastSocket
+      ) {
+        return;
+      }
+
+      icecastSocket = null;
+
+      if (
+        activeSocket ||
+        reconnectGraceActive
       ) {
         stopBroadcast(
           "Icecast connection closed",
@@ -472,11 +743,30 @@ const server =
         res.end(
           JSON.stringify({
             ok: true,
+
             broadcasting:
               Boolean(
                 activeSocket,
+              ) ||
+              reconnectGraceActive,
+
+            connected:
+              Boolean(
+                activeSocket,
               ),
+
+            reconnecting:
+              reconnectGraceActive,
+
             pcmReady,
+
+            streamHasStarted,
+
+            lastAudioDataAgeMs:
+              lastAudioDataAt
+                ? Date.now() -
+                  lastAudioDataAt
+                : null,
           }),
         );
 
@@ -597,11 +887,41 @@ wss.on(
       return;
     }
 
+    const wasReconnecting =
+      reconnectGraceActive;
+
+    clearReconnectGrace();
+
+    stopSilenceFfmpeg();
+
     activeSocket = socket;
 
-    console.log(
-      "DJ connected with valid stream token",
-    );
+    let pingTimer =
+      setInterval(() => {
+        if (
+          socket.readyState === 1
+        ) {
+          try {
+            socket.ping();
+          } catch {}
+        }
+      }, WEBSOCKET_PING_INTERVAL_MS);
+
+    streamHasStarted = false;
+    lastAudioDataAt =
+      Date.now();
+
+    startAudioWatchdog();
+
+    if (wasReconnecting) {
+      console.log(
+        "DJ reconnected within grace period",
+      );
+    } else {
+      console.log(
+        "DJ connected with valid stream token",
+      );
+    }
 
     socket.on(
       "message",
@@ -622,11 +942,21 @@ wss.on(
               message.format ===
                 "webm"
             ) {
-              if (
-                !ffmpeg &&
-                !icecastSocket
-              ) {
-                startRelay();
+              streamHasStarted = true;
+
+              lastAudioDataAt =
+                Date.now();
+
+              if (!ffmpeg) {
+                if (
+                  icecastSocket &&
+                  !icecastSocket.destroyed &&
+                  icecastSocket.writable
+                ) {
+                  startFfmpeg();
+                } else {
+                  startRelay();
+                }
               }
             }
 
@@ -645,6 +975,9 @@ wss.on(
             return;
           }
         }
+
+        lastAudioDataAt =
+          Date.now();
 
         if (
           pcmReady &&
@@ -680,20 +1013,40 @@ wss.on(
     socket.on(
       "close",
       () => {
+        if (pingTimer) {
+          clearInterval(
+            pingTimer,
+          );
+
+          pingTimer = null;
+        }
+
         if (
-          socket ===
+          socket !==
           activeSocket
         ) {
-          stopBroadcast(
-            "DJ disconnected",
-          );
+          return;
         }
+
+        activeSocket = null;
+
+        beginReconnectGrace(
+          "DJ WebSocket disconnected",
+        );
       },
     );
 
     socket.on(
       "error",
       (error) => {
+        if (pingTimer) {
+          clearInterval(
+            pingTimer,
+          );
+
+          pingTimer = null;
+        }
+
         console.error(
           "WebSocket error:",
           error.message,
@@ -703,7 +1056,7 @@ wss.on(
           socket ===
           activeSocket
         ) {
-          stopBroadcast(
+          handleLostDjConnection(
             "DJ WebSocket error",
           );
         }
