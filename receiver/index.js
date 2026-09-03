@@ -1,5 +1,6 @@
 const crypto = require("crypto");
 const http = require("http");
+const https = require("https");
 const net = require("net");
 const fs = require("fs");
 const { spawn } = require("child_process");
@@ -495,6 +496,50 @@ function startSilenceFfmpeg() {
   );
 }
 
+function clearDjApproval() {
+  const request = https.request(
+    {
+      hostname:
+        "beta.jazbazphilippines.com",
+      port: 443,
+      path: "/api/dj-off-air",
+      method: "POST",
+      headers: {
+        Authorization:
+          `Bearer ${STREAM_TOKEN_SECRET}`,
+      },
+    },
+    (response) => {
+      response.resume();
+
+      if (
+        response.statusCode >= 200 &&
+        response.statusCode < 300
+      ) {
+        console.log(
+          "DJ approval cleared after reconnect expiry",
+        );
+      } else {
+        console.error(
+          `Failed to clear DJ approval: HTTP ${response.statusCode}`,
+        );
+      }
+    },
+  );
+
+  request.on(
+    "error",
+    (error) => {
+      console.error(
+        "Failed to clear DJ approval:",
+        error.message,
+      );
+    },
+  );
+
+  request.end();
+}
+
 function beginReconnectGrace(
   reason = "DJ disconnected",
 ) {
@@ -526,6 +571,8 @@ function beginReconnectGrace(
         stopBroadcast(
           "DJ reconnect grace period expired",
         );
+
+        clearDjApproval();
       }
     }, RECONNECT_GRACE_MS);
 }
