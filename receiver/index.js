@@ -985,6 +985,22 @@ wss.on(
 
             if (
               message.type ===
+              "stop"
+            ) {
+              if (
+                socket ===
+                activeSocket
+              ) {
+                stopBroadcast(
+                  "DJ stopped broadcast intentionally",
+                );
+              }
+
+              return;
+            }
+
+            if (
+              message.type ===
                 "opus-start" &&
               message.format ===
                 "webm"
